@@ -5,6 +5,7 @@ from fastai.vision.all import *
 import logging
 import json
 import google.generativeai as genai
+from pathlib import Path
 
 app = Flask(__name__)
 CORS(app)
@@ -30,11 +31,13 @@ model = genai.GenerativeModel(
 )
 
 def load_model():
-    learn = load_learner('export.pkl')
+    model_path = Path('export_fixed.pkl')  # Use Path for cross-platform compatibility
+    learn = load_learner(model_path)
     return learn
 
 def load_recommendations():
-    with open('recommendation.json') as f:
+    recommendations_path = Path('recommendation.json')
+    with open(recommendations_path) as f:
         recommendations = json.load(f)
     return recommendations
 
