@@ -16,7 +16,7 @@ db = client['facialAnalysisApp']
 collection = db['recommendation']
 
 # Configure the API key for Google AI
-os.environ["GEMINI_API_KEY"] = "AIzaSyA66mTgaASSoa6F9lXj2Zpuxx5QhkS55CM"  
+os.environ["GEMINI_API_KEY"] = "AIzaSyBllq6SnaKfsYvOgsHb2jW446LCE4ljRDw"  
 genai.configure(api_key=os.environ["GEMINI_API_KEY"])
 
 # Set up the model configuration
