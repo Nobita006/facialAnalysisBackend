@@ -1,0 +1,7 @@
+# Ignore all .mp3 files
+*.mp3
+
+# Ignore the virtual environment folder
+venv/
+env/
+__pycache__/
