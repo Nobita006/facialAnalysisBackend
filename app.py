@@ -1,401 +1,233 @@
 import os
 import logging
-import time
-import uuid
-import asyncio
-import aiohttp
-import requests
-import nltk
-from bs4 import BeautifulSoup
-from nltk.tokenize import sent_tokenize, word_tokenize
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from gtts import gTTS
-from typing import List, Dict, Tuple
-from collections import Counter
+import json
+from pathlib import Path
 
-print("Setting HF_HUB_DISABLE_SYMLINKS_WARNING to 1")
-os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"  # Windows symlink warning
+from flask import Flask, request, jsonify, send_file, after_this_request, make_response
+from flask_cors import CORS
 
-import torch
-device = 0 if torch.cuda.is_available() else -1  # Use GPU if available
-print(f"PyTorch device set: {'GPU' if device==0 else 'CPU'}")
+from fastai.vision.all import *
+import google.generativeai as genai
+from pymongo import MongoClient
 
-from transformers import pipeline
-import spacy
-from googletrans import Translator  # googletrans==4.0.0-rc1
-from keybert import KeyBERT
-from sentence_transformers import SentenceTransformer
+# Import functions from utils.py (make sure utils.py is in the same folder)
+from utils import (
+    fetch_news, process_article, comparative_analysis, generate_tts,
+    advanced_summarize, extended_analysis, build_embeddings
+)
+import os
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-print("Logging is set up.")
+# Initialize Flask app and enable CORS for all routes
+app = Flask(__name__)
+CORS(app)
 
-# NLTK downloads
-print("Downloading NLTK data...")
-nltk.download('punkt')
-nltk.download('punkt_tab')
-nltk.download('averaged_perceptron_tagger')
+# Set up logging configuration
+logging.basicConfig(level=logging.INFO)
 
-# spaCy
-try:
-    print("Loading spaCy model 'en_core_web_sm'...")
-    nlp = spacy.load("en_core_web_sm")
-except Exception:
-    print("spaCy model not found. Downloading 'en_core_web_sm'...")
-    spacy.cli.download("en_core_web_sm")
-    nlp = spacy.load("en_core_web_sm")
+# --- Configuration for Facial Analysis and Chatbot functionalities ---
+# MongoDB connection for facial analysis recommendations
+client = MongoClient('mongodb+srv://Sayandas:Sayanat2001@cluster0.iu2x4ch.mongodb.net/')
+db = client['facialAnalysisApp']
+collection = db['recommendation']
 
-# Summarizer
-try:
-    print("Loading summarizer pipeline...")
-    summarizer = pipeline(
-        "summarization",
-        model="sshleifer/distilbart-cnn-12-6",
-        revision="a4f8f3e",
-        device=device
-    )
-except Exception as e:
-    print(f"Error loading summarizer pipeline: {e}")
-    logging.error(f"Error loading summarization pipeline: {e}")
-    summarizer = None
+# Configure the API key for Google AI (Generative AI)
+os.environ["GEMINI_API_KEY"] = "AIzaSyBllq6SnaKfsYvOgsHb2jW446LCE4ljRDw"
+genai.configure(api_key=os.environ["GEMINI_API_KEY"])
 
-# Sentiment pipeline (binary)
-try:
-    print("Loading sentiment analysis pipeline...")
-    sentiment_pipeline = pipeline(
-        "sentiment-analysis",
-        model="distilbert-base-uncased-finetuned-sst-2-english",
-        device=device
-    )
-except Exception as e:
-    print(f"Error loading sentiment analysis pipeline: {e}")
-    logging.error(f"Error loading transformer sentiment analyzer: {e}")
-    sentiment_pipeline = None
+# Generation configuration for the generative model (chatbot)
+generation_config = {
+    "temperature": 0.5,
+    "top_p": 0.95,
+    "top_k": 64,
+    "max_output_tokens": 212,
+    "response_mime_type": "text/plain",
+}
 
-# KeyBERT
-try:
-    print("Initializing KeyBERT model...")
-    kw_model = KeyBERT()
-except Exception as e:
-    print(f"Error initializing KeyBERT: {e}")
-    logging.error(f"Error initializing KeyBERT: {e}")
-    kw_model = None
+# Create a GenerativeModel instance with the specified configuration
+model = genai.GenerativeModel(
+    model_name="gemini-1.5-flash",
+    generation_config=generation_config,
+    system_instruction="Provide expert and short advice on skincare routines, recommend products based on different skin types and conditions, and answer questions with a friendly and professional tone. Keep the replies very brief and precise. Also, you can ask for details to get a better understanding of the problem.",
+)
 
-# Translator for Hindi TTS
-print("Initializing translator for Hindi TTS...")
-translator = Translator()
+# --- Functions for Facial Analysis (Fastai) ---
+def load_model():
+    model_path = Path('export_fixed.pkl')  # Use Path for cross-platform compatibility
+    learn = load_learner(model_path)
+    return learn
 
-# SentenceTransformer for semantic search
-try:
-    print("Loading SentenceTransformer model for semantic search...")
-    st_model = SentenceTransformer('all-MiniLM-L6-v2', device=("cuda" if torch.cuda.is_available() else "cpu"))
-except Exception as e:
-    print(f"Error loading SentenceTransformer: {e}")
-    logging.error(f"Error loading SentenceTransformer: {e}")
-    st_model = None
+def load_recommendations():
+    recommendations = {}
+    # Fetch all the records from the MongoDB collection
+    data = collection.find()
+    for item in data:
+        condition = item['condition']
+        products = item['products']
+        recommendations[condition] = products
+    return recommendations
 
-# In-memory cache
-cache = {}
-CACHE_EXPIRY = 300  # 5 minutes
-print("In-memory cache initialized.")
+def get_labels(learner):
+    return learner.dls.vocab
 
-def get_from_cache(key: str):
-    if key in cache:
-        entry = cache[key]
-        if time.time() - entry["time"] < CACHE_EXPIRY:
-            print(f"Cache hit for key: {key}")
-            return entry["data"]
-        else:
-            print(f"Cache expired for key: {key}")
-    else:
-        print(f"No cache entry for key: {key}")
-    return None
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'  # Allow requests from any domain
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    return response
 
-def set_cache(key: str, data):
-    cache[key] = {"data": data, "time": time.time()}
-    # print(f"Cache set for key: {key}")
+def predict_image(img_path, learner):
+    img = PILImage.create(img_path)
+    pred, pred_idx, probs = learner.predict(img)
+    labels = get_labels(learner)
+    predictions = {labels[i]: float(probs[i]) for i in range(len(labels))}
+    return predictions
 
-async def fetch_article_content(session: aiohttp.ClientSession, url: str) -> str:
-    headers = {"User-Agent": "Mozilla/5.0"}
-    # print(f"Fetching article content from URL: {url}")
+# --- Endpoints from the Facial Analysis & Chatbot App ---
+@app.route('/predict', methods=['POST'])
+def predict():
     try:
-        async with session.get(url, headers=headers, timeout=10) as response:
-            text = await response.text()
-            soup = BeautifulSoup(text, 'html.parser')
-            paragraphs = soup.find_all('p')
-            if paragraphs:
-                content = " ".join(p.get_text(strip=True) for p in paragraphs[:3])
-                # print(f"Fetched article content (first 100 chars): {content[:100]}...")
-                return content
-            print("No paragraphs found in article.")
-            return ""
+        learner = load_model()
+        recommendations = load_recommendations()
+
+        image_file = request.files['image']
+        img_path = 'temp.jpg'
+        image_file.save(img_path)
+
+        predictions = predict_image(img_path, learner)
+        os.remove(img_path)
+
+        # Get recommended products for each condition from the predictions
+        recommended_products = {condition: recommendations.get(condition, []) for condition in predictions}
+
+        response = jsonify({'predictions': predictions, 'recommendations': recommended_products})
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers['Content-Type'] = 'application/json'
+        return response
     except Exception as e:
-        print(f"Error fetching article content from {url}: {e}")
-        logging.error(f"Error fetching article content asynchronously from {url}: {e}")
-        return ""
+        logging.error(str(e))
+        response = jsonify({'error': str(e)})
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers['Content-Type'] = 'application/json'
+        return response
 
-async def process_card(card) -> Dict:
-    # print("Processing a result card...")
-    link_tag = card.find('a', attrs={"data-testid": "internal-link"})
-    link = None
-    if link_tag and link_tag.has_attr('href'):
-        href = link_tag['href']
-        link = "https://www.bbc.com" + href if href.startswith('/') else href
-        # print(f"Extracted link: {link}")
-    title_tag = card.find('h2', attrs={"data-testid": "card-headline"})
-    title = title_tag.get_text(strip=True) if title_tag else "No Title Found"
-    # print(f"Extracted title: {title}")
-    snippet_tag = card.find('div', class_='sc-4ea10043-3')
-    snippet = snippet_tag.get_text(strip=True) if snippet_tag else ""
-    summary = snippet
-
-    if link:
-        # print("Fetching extended content for the card...")
-        async with aiohttp.ClientSession() as session:
-            content = await fetch_article_content(session, link)
-            if content and len(content) > len(snippet):
-                summary = content
-                # print("Using extended article content as summary.")
-    return {
-        "Title": title,
-        "Link": link,
-        "Summary": summary if summary else "Summary not available"
-    }
-
-async def process_page(page: int, base_url: str, headers: Dict, company: str) -> List[Dict]:
-    print(f"Processing page {page} for company: {company}")
-    params = {"q": company, "page": page}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(base_url, params=params, headers=headers, timeout=10) as response:
-            text = await response.text()
-            soup = BeautifulSoup(text, 'html.parser')
-            result_cards = soup.find_all('div', attrs={"data-testid": "newport-card"})
-            print(f"Found {len(result_cards)} result cards on page {page}.")
-            tasks = [process_card(card) for card in result_cards]
-            page_articles = await asyncio.gather(*tasks)
-            print(f"Processed {len(page_articles)} articles on page {page}.")
-            return page_articles
-
-def fetch_news(company_name: str, num_articles: int = 15) -> List[Dict[str, str]]:
-    print(f"Fetching news for company: {company_name}, targeting {num_articles} articles.")
-    cache_key = f"bbc_{company_name}_{num_articles}"
-    cached = get_from_cache(cache_key)
-    if cached:
-        print("Returning cached news data.")
-        return cached
-
-    base_url = "https://www.bbc.com/search"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    articles = []
-    max_pages = 5
-
-    async def main():
-        nonlocal articles
-        for page in range(1, max_pages + 1):
-            print(f"Fetching page {page}...")
-            page_articles = await process_page(page, base_url, headers, company_name)
-            articles.extend(page_articles)
-            print(f"Total articles collected so far: {len(articles)}")
-            if len(articles) >= num_articles:
-                break
-
-    asyncio.run(main())
-    articles = articles[:num_articles]
-    set_cache(cache_key, articles)
-    print(f"Returning {len(articles)} articles for company: {company_name}.")
-    return articles
-
-def summarize_text(text: str, num_sentences: int = 3) -> str:
-    # print("Summarizing text using basic sentence tokenization.")
-    sentences = sent_tokenize(text)
-    summary = " ".join(sentences[:num_sentences]) if sentences else text
-    # print(f"Summary: {summary}")
-    return summary
-
-def advanced_summarize(text: str, num_sentences: int = 1) -> str:
-    # print("Attempting advanced summarization...")
-    if summarizer and len(text.split()) > 50:
-        try:
-            max_len = 130 if len(text.split()) >= 130 else len(text.split())
-            result = summarizer(text, max_length=max_len, min_length=30, do_sample=False)
-            summary = result[0]['summary_text']
-            # print("Advanced summarization successful.")
-            return summary
-        except Exception as e:
-            # print(f"Transformer summarization error: {e}")
-            logging.error(f"Transformer summarization error: {e}")
-    # print("Falling back to basic summarization.")
-    return summarize_text(text, num_sentences)
-
-def analyze_sentiment(text: str) -> Tuple[str, Dict[str, float]]:
-    # print("Analyzing sentiment for given text...")
-    if sentiment_pipeline:
-        try:
-            result = sentiment_pipeline(text)[0]  # e.g. {"label": "POSITIVE", "score": 0.98}
-            label = result.get("label", "NEUTRAL").upper()  # "POSITIVE"/"NEGATIVE"/(rarely) "NEUTRAL"
-            score = result.get("score", 0.0)
-            # print(f"Sentiment pipeline result: {label} with score {score}")
-            if label == "POSITIVE":
-                return "Positive", {"compound": score, "raw": result}
-            elif label == "NEGATIVE":
-                return "Negative", {"compound": score, "raw": result}
-            else:
-                return "Neutral", {"compound": score, "raw": result}
-        except Exception as e:
-            print(f"Error in sentiment analysis using pipeline: {e}")
-            logging.error(f"Transformer sentiment analysis error: {e}")
-
-    print("Falling back to VADER sentiment analysis.")
-    analyzer = SentimentIntensityAnalyzer()
-    scores = analyzer.polarity_scores(text)
-    compound = scores["compound"]
-    print(f"VADER sentiment scores: {scores}")
-    if compound >= 0.05:
-        return "Positive", scores
-    elif compound <= -0.05:
-        return "Negative", scores
-    else:
-        return "Neutral", scores
-
-def extract_topics(text: str, num_topics: int = 5) -> List[str]:
-    # print("Extracting topics from text...")
-    if kw_model:
-        try:
-            keywords = kw_model.extract_keywords(
-                text,
-                keyphrase_ngram_range=(1, 2),
-                stop_words='english',
-                top_n=num_topics
-            )
-            topics = [kw[0] for kw in keywords]
-            # print(f"Extracted topics using KeyBERT: {topics}")
-            return topics
-        except Exception as e:
-            print(f"Error extracting topics using KeyBERT: {e}")
-            logging.error(f"KeyBERT topic extraction error: {e}")
-    print("Falling back to spaCy noun-chunks for topic extraction.")
-    doc = nlp(text)
-    chunks = [chunk.text.lower() for chunk in doc.noun_chunks]
-    freq = {}
-    for c in chunks:
-        freq[c] = freq.get(c, 0) + 1
-    sorted_chunks = sorted(freq.items(), key=lambda x: x[1], reverse=True)
-    topics = [c for c, _ in sorted_chunks[:num_topics]]
-    print(f"Extracted topics using noun-chunks: {topics}")
-    return topics
-
-def translate_to_hindi(text: str) -> str:
-    print("Translating text to Hindi...")
+@app.route('/chatbot', methods=['POST'])
+def chatbot_response():
     try:
-        translated = translator.translate(text, dest='hi')
-        # print(f"Translation successful (first 100 chars): {translated.text[:100]}...")
-        return translated.text
+        # Get the user's message and conversation history from the request
+        user_input = request.json.get('message')
+        history = request.json.get('history', [])
+
+        # Ensure history is a list before processing
+        if not isinstance(history, list):
+            history = []
+
+        # Convert history to the format required by the generative AI SDK
+        formatted_history = [
+            {"role": item["role"], "parts": [item["content"]]} for item in history if "role" in item and "content" in item
+        ]
+
+        # Start a new chat session with the model, including the formatted history
+        chat_session = model.start_chat(history=formatted_history)
+
+        # Send the user's message to the model
+        response_obj = chat_session.send_message(user_input)
+        bot_response = response_obj.text
+
+        # Append the conversation to the history
+        history.append({"role": "user", "content": user_input})
+        history.append({"role": "model", "content": bot_response})
+
+        return jsonify({'response': bot_response, 'history': history}), 200
     except Exception as e:
-        print(f"Translation error: {e}")
-        logging.error(f"Translation error: {e}")
-        return text
+        logging.error(str(e))
+        return jsonify({'error': str(e)}), 500
 
-def process_article(article: Dict[str, str]) -> Dict:
-    # print("Processing an article...")
-    original_summary = article.get("Summary", "")
-    if original_summary and original_summary != "Summary not available":
-        # print("Article has valid summary. Running advanced summarization, sentiment analysis, and topic extraction.")
-        summarized_text = advanced_summarize(original_summary)
-        sentiment, scores = analyze_sentiment(summarized_text)
-        topics = extract_topics(summarized_text)
-    else:
-        print("Article does not have a valid summary. Skipping analysis.")
-        summarized_text = original_summary
-        sentiment, scores = "Neutral", {"compound": 0.0}
-        topics = []
-    return {
-        "Title": article.get("Title") or "No Title Found",
-        "Summary": summarized_text,
-        "Sentiment": sentiment,
-        "Sentiment Scores": scores,
-        "Topics": topics
-    }
+# --- Endpoints from the News Analysis API (api.py) ---
+@app.route("/", methods=["GET"])
+def home():
+    print("Home endpoint accessed.")
+    return {"status": "Backend is running!"}
 
-def comparative_analysis(articles: List[Dict]) -> Dict:
-    # print("Performing comparative analysis on articles...")
-    sentiment_counts = {"Positive": 0, "Negative": 0, "Neutral": 0}
-    for art in articles:
-        s = art.get("Sentiment", "Neutral")
-        sentiment_counts[s] += 1
+@app.route('/analyze', methods=['POST'])
+def analyze():
+    data = request.get_json()
+    company = data.get("company")
+    if not company:
+        return jsonify({"error": "Company name not provided"}), 400
 
-    pos_titles = [a["Title"] for a in articles if a["Sentiment"] == "Positive"]
-    neg_titles = [a["Title"] for a in articles if a["Sentiment"] == "Negative"]
+    print(f"Analyzing company: {company}")
 
-    comparisons = []
-    if pos_titles and neg_titles:
-        comparison_text = f"Positive articles ({', '.join(pos_titles)}) highlight opportunities, while negative articles ({', '.join(neg_titles)}) emphasize challenges."
-        # print("Adding comparative analysis with both positive and negative articles.")
-        comparisons.append({
-            "Comparison": comparison_text,
-            "Impact": "This indicates mixed market sentiment."
-        })
-    all_titles = [a["Title"] for a in articles]
-    overall_comparison = f"Overall, the coverage spans: {', '.join(all_titles)}."
-    comparisons.append({
-        "Comparison": overall_comparison,
-        "Impact": "The news reflects a broad spectrum of perspectives."
+    # Fetch BBC articles asynchronously
+    raw_articles = fetch_news(company, num_articles=15)
+    if not raw_articles:
+        return jsonify({"error": f"No articles found for '{company}'."}), 404
+
+    processed_articles = [process_article(a) for a in raw_articles]
+
+    # Minimal output
+    articles_output = [{
+        "Title": art["Title"],
+        "Summary": art["Summary"],
+        "Sentiment": art["Sentiment"],
+        "Topics": art["Topics"]
+    } for art in processed_articles]
+
+    # Basic + Extended Analysis
+    comp_analysis = comparative_analysis(processed_articles)
+    ext_analysis = extended_analysis(processed_articles)
+    embeddings = build_embeddings(processed_articles)
+
+    # Determine majority sentiment
+    sentiment_dist = comp_analysis.get("Sentiment Distribution", {})
+    majority = "Neutral"
+    pos_count = sentiment_dist.get("Positive", 0)
+    neg_count = sentiment_dist.get("Negative", 0)
+    if pos_count > neg_count:
+        majority = "Positive"
+    elif neg_count > pos_count:
+        majority = "Negative"
+
+    # Summarize all articles
+    aggregated_text = " ".join(a["Summary"] for a in processed_articles)
+    short_summary = advanced_summarize(aggregated_text, num_sentences=1)
+    final_sentiment = f"{company}'s latest news is mostly {majority}. {short_summary}"
+    final_sentiment = final_sentiment.replace(" .", ".")
+
+    # Generate TTS audio
+    audio_file = generate_tts(f"कंपनी {company}. {final_sentiment}", lang='hi')
+    print(f"TTS generated: {audio_file}")
+
+    return jsonify({
+        "Company": company,
+        "Articles": articles_output,
+        "Comparative Sentiment Score": comp_analysis,
+        "Extended Analysis": ext_analysis,
+        "Final Sentiment Analysis": final_sentiment,
+        "Embeddings": embeddings,  # for semantic search
+        "Audio": audio_file
     })
-    print("Comparative analysis done.")
 
-    pos_topics = set().union(*(set(a["Topics"]) for a in articles if a["Sentiment"] == "Positive"))
-    neg_topics = set().union(*(set(a["Topics"]) for a in articles if a["Sentiment"] == "Negative"))
-    common_topics = list(pos_topics.intersection(neg_topics))
-    unique_pos = list(pos_topics - set(common_topics))
-    unique_neg = list(neg_topics - set(common_topics))
+@app.route('/audio/<filename>', methods=['GET'])
+def get_audio(filename):
+    print(f"Serving audio file: {filename}")
+    @after_this_request
+    def remove_file(response):
+        try:
+            os.remove(filename)
+            print(f"Removed file: {filename}")
+        except Exception as error:
+            print(f"Error removing file {filename}: {error}")
+        return response
 
-    return {
-        "Sentiment Distribution": sentiment_counts,
-        "Coverage Differences": comparisons,
-        "Topic Overlap": {
-            "Common Topics": common_topics,
-            "Unique Topics in Positive Articles": unique_pos,
-            "Unique Topics in Negative Articles": unique_neg
-        }
-    }
-
-def extended_analysis(articles: List[Dict]) -> Dict:
-    # print("Performing extended analysis on articles...")
-    all_text = " ".join(a["Summary"] for a in articles if a["Summary"])
-    doc = nlp(all_text)
-    entities = [ent.text for ent in doc.ents]
-    entity_counts = Counter(entities).most_common(10)
-    print("Entity counts extracted.")
-
-    tokens = word_tokenize(all_text.lower())
-    tokens = [t for t in tokens if t.isalpha() and len(t) > 3]
-    word_counts = Counter(tokens).most_common(10)
-    print("Word counts extracted.")
-
-    return {
-        "Entity Counts": entity_counts,
-        "Word Counts": word_counts
-    }
-
-def build_embeddings(articles: List[Dict]) -> List[List[float]]:
-    print("Building embeddings for semantic search...")
-    if not st_model:
-        print("SentenceTransformer model not available. Returning empty embeddings.")
-        return []
-    summaries = [a["Summary"] for a in articles]
-    emb = st_model.encode(summaries, convert_to_tensor=True)
-    print("Embeddings built successfully.")
-    return emb.cpu().numpy().tolist()
-
-def generate_tts(text: str, lang: str = 'hi') -> str:
-    # print("Generating TTS audio...")
-    hindi_text = translate_to_hindi(text)
     try:
-        tts = gTTS(text=hindi_text, lang=lang)
-        filename = f"tts_{uuid.uuid4().hex}.mp3"
-        tts.save(filename)
-        # print(f"TTS generated and saved as: {filename}")
-        logging.info(f"TTS generated: {filename}")
-        return filename
+        with open(filename, "rb") as f:
+            audio_data = f.read()
+        response = make_response(audio_data)
+        response.headers["Content-Type"] = "audio/mp3"
+        return response
     except Exception as e:
-        print(f"Error generating TTS: {e}")
-        logging.error(f"Error generating TTS: {e}")
-        return ""
+        print(f"Error reading audio file {filename}: {e}")
+        return jsonify({"error": "Audio file not found"}), 404
+
+# --- Run the Combined Flask App ---
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', use_reloader=False)
