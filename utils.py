@@ -27,9 +27,9 @@ from sentence_transformers import SentenceTransformer
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # NLTK downloads
-nltk.download('punkt', force=True)
-nltk.download('punkt_tab',force=True)
-nltk.download('averaged_perceptron_tagger', force=True)
+nltk.download('punkt')
+nltk.download('punkt_tab')
+nltk.download('averaged_perceptron_tagger')
 
 # spaCy
 try:
@@ -101,18 +101,47 @@ async def fetch_article_content(session: aiohttp.ClientSession, url: str) -> str
             soup = BeautifulSoup(text, 'html.parser')
             paragraphs = soup.find_all('p')
             if paragraphs:
-                combined = " ".join(p.get_text(strip=True) for p in paragraphs[:3])
-                return combined
+                return " ".join(p.get_text(strip=True) for p in paragraphs[:3])
             return ""
     except Exception as e:
         logging.error(f"Error fetching article content asynchronously from {url}: {e}")
         return ""
 
+async def process_card(card) -> Dict:
+    link_tag = card.find('a', attrs={"data-testid": "internal-link"})
+    link = None
+    if link_tag and link_tag.has_attr('href'):
+        href = link_tag['href']
+        link = "https://www.bbc.com" + href if href.startswith('/') else href
+    title_tag = card.find('h2', attrs={"data-testid": "card-headline"})
+    title = title_tag.get_text(strip=True) if title_tag else "No Title Found"
+    snippet_tag = card.find('div', class_='sc-4ea10043-3')
+    snippet = snippet_tag.get_text(strip=True) if snippet_tag else ""
+    summary = snippet
+
+    if link:
+        async with aiohttp.ClientSession() as session:
+            content = await fetch_article_content(session, link)
+            if content and len(content) > len(snippet):
+                summary = content
+    return {
+        "Title": title,
+        "Link": link,
+        "Summary": summary if summary else "Summary not available"
+    }
+
+async def process_page(page: int, base_url: str, headers: Dict, company: str) -> List[Dict]:
+    params = {"q": company, "page": page}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(base_url, params=params, headers=headers, timeout=10) as response:
+            text = await response.text()
+            soup = BeautifulSoup(text, 'html.parser')
+            result_cards = soup.find_all('div', attrs={"data-testid": "newport-card"})
+            tasks = [process_card(card) for card in result_cards]
+            page_articles = await asyncio.gather(*tasks)
+            return page_articles
+
 def fetch_news(company_name: str, num_articles: int = 15) -> List[Dict[str, str]]:
-    """
-    Fetch BBC news articles about the given company.
-    Loops up to 5 pages to collect at least num_articles.
-    """
     cache_key = f"bbc_{company_name}_{num_articles}"
     cached = get_from_cache(cache_key)
     if cached:
@@ -122,56 +151,17 @@ def fetch_news(company_name: str, num_articles: int = 15) -> List[Dict[str, str]
     base_url = "https://www.bbc.com/search"
     headers = {"User-Agent": "Mozilla/5.0"}
     articles = []
-    page = 1
     max_pages = 5
 
-    while len(articles) < num_articles and page <= max_pages:
-        try:
-            params = {"q": company_name, "page": page}
-            response = requests.get(base_url, params=params, headers=headers, timeout=10)
-            response.raise_for_status()
-        except Exception as e:
-            logging.error(f"Failed to fetch BBC search results for '{company_name}' on page {page}: {e}")
-            break
+    async def main():
+        nonlocal articles
+        for page in range(1, max_pages + 1):
+            page_articles = await process_page(page, base_url, headers, company_name)
+            articles.extend(page_articles)
+            if len(articles) >= num_articles:
+                break
 
-        soup = BeautifulSoup(response.text, 'html.parser')
-        result_cards = soup.find_all('div', attrs={"data-testid": "newport-card"})
-        logging.info(f"Found {len(result_cards)} BBC search results for '{company_name}' on page {page}.")
-        if not result_cards:
-            break
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        async def process_card(card):
-            link_tag = card.find('a', attrs={"data-testid": "internal-link"})
-            link = None
-            if link_tag and link_tag.has_attr('href'):
-                href = link_tag['href']
-                link = "https://www.bbc.com" + href if href.startswith('/') else href
-            title_tag = card.find('h2', attrs={"data-testid": "card-headline"})
-            title = title_tag.get_text(strip=True) if title_tag else "No Title Found"
-            snippet_tag = card.find('div', class_='sc-4ea10043-3')
-            snippet = snippet_tag.get_text(strip=True) if snippet_tag else ""
-            summary = snippet
-            if link:
-                async with aiohttp.ClientSession() as sess:
-                    content = await fetch_article_content(sess, link)
-                    if content and len(content) > len(snippet):
-                        summary = content
-            return {
-                "Title": title,
-                "Link": link,
-                "Summary": summary if summary else "Summary not available"
-            }
-
-        tasks = [process_card(c) for c in result_cards]
-        page_articles = loop.run_until_complete(asyncio.gather(*tasks))
-        loop.close()
-
-        articles.extend(page_articles)
-        page += 1
-
+    asyncio.run(main())
     articles = articles[:num_articles]
     set_cache(cache_key, articles)
     return articles
